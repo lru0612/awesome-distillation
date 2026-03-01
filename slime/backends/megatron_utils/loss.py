@@ -380,6 +380,10 @@ def apply_opd_kl_to_advantages(
     if student_log_probs is None:
         return
 
+    # When opd_kl_coef is 0, the reverse-KL penalty has no effect; skip teacher_log_probs requirement
+    if args.opd_kl_coef == 0:
+        return
+
     teacher_log_probs = rollout_data.get("teacher_log_probs")
     if teacher_log_probs is None:
         raise ValueError(f"OPD with opd_type='{args.opd_type}' requires teacher_log_probs, but it is missing.")
@@ -492,8 +496,7 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
         raise NotImplementedError(f"advantage_estimator {args.advantage_estimator} is not supported. ")
 
     # Apply on-policy distillation KL penalty to advantages (orthogonal to advantage estimator)
-    # Skip for opsd: OPSD computes full-vocabulary JSD in the forward pass, not via log-prob KL on advantages.
-    if args.use_opd and getattr(args, "opd_type", None) != "opsd":
+    if args.use_opd:
         apply_opd_kl_to_advantages(
             args=args,
             rollout_data=rollout_data,
@@ -777,8 +780,8 @@ def policy_loss_function(
     else:
         loss = pg_loss - args.entropy_coef * entropy_loss
 
-    # OPSD: add JSD loss
-    if args.use_opd and args.opd_type == "opsd" and args.opsd_jsd_coef > 0 and "opsd_jsd_values" in batch:
+    # OPSD: add full-vocabulary JSD loss (computed by hook in forward pass)
+    if args.use_opd and args.opd_type == "opsd" and getattr(args, "opsd_jsd_coef", 0) > 0 and "opsd_jsd_values" in batch:
         opsd_jsd = torch.cat(batch["opsd_jsd_values"], dim=0)
         opsd_jsd_loss = sum_of_sample_mean(opsd_jsd)
         loss = loss + args.opsd_jsd_coef * opsd_jsd_loss
