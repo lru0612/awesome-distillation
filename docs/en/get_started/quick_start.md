@@ -32,9 +32,21 @@ Please execute the following commands to pull the latest image and start an inte
 docker pull slimerl/slime:latest
 
 # Start the container
-docker run --rm --gpus all --ipc=host --shm-size=16g \
+# docker run --rm --gpus all --ipc=host --shm-size=16g \
+#   --ulimit memlock=-1 --ulimit stack=67108864 \
+#   -it slimerl/slime:latest /bin/bash
+
+# For our awesome distillation
+# Change the path to your real one
+docker run --rm --gpus all --ipc=host --shm-size=64g \
   --ulimit memlock=-1 --ulimit stack=67108864 \
+  -v /data/siqizhu4/weiyeshi/slime:/root/slime \
+  -v /data/siqizhu4/weiyeshi/ray_tmp:/tmp/ray \
+  -v /data/siqizhu4/weiyeshi/checkpoints:/root/checkpoints \
+  -v /data/siqizhu4/weiyeshi/huggingface_cache:/root/.cache/huggingface \
+  -w /root/slime \
   -it slimerl/slime:latest /bin/bash
+
 ```
 
 ### Install slime
