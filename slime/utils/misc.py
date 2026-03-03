@@ -1,5 +1,8 @@
 import importlib
+import re
+import shutil
 import subprocess
+from pathlib import Path
 
 import ray
 
@@ -92,6 +95,39 @@ def should_run_periodic_action(
 
     step = rollout_id + 1
     return (step % interval == 0) or (num_rollout_per_epoch is not None and step % num_rollout_per_epoch == 0)
+
+
+def prune_old_checkpoints(save_dir: str, max_keep: int) -> None:
+    """Remove oldest iter_* checkpoints when count exceeds max_keep.
+
+    Keeps the max_keep most recent checkpoints (by iteration number).
+    Only removes directories matching iter_\\d{7} pattern.
+
+    Args:
+        save_dir: Base checkpoint directory (e.g. args.save).
+        max_keep: Maximum number of checkpoints to retain.
+    """
+    if max_keep is None or max_keep <= 0:
+        return
+    path = Path(save_dir).expanduser()
+    if not path.exists():
+        return
+    pattern = re.compile(r"^iter_(\d{7})$")
+    checkpoints = []
+    for d in path.iterdir():
+        if d.is_dir():
+            m = pattern.match(d.name)
+            if m:
+                checkpoints.append((int(m.group(1)), d))
+    if len(checkpoints) <= max_keep:
+        return
+    checkpoints.sort(key=lambda x: x[0], reverse=True)  # newest first
+    for _, ckpt_dir in checkpoints[max_keep:]:
+        try:
+            shutil.rmtree(ckpt_dir)
+            print(f"[checkpoint] Pruned old checkpoint: {ckpt_dir}", flush=True)
+        except OSError as e:
+            print(f"[checkpoint] Failed to prune {ckpt_dir}: {e}", flush=True)
 
 
 class Box:

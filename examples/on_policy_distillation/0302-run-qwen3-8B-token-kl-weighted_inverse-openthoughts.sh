@@ -1,17 +1,12 @@
 #!/bin/bash
 
-# Token-KL-Weighted OPSD on DAPO-17k
-# Usage: bash examples/on_policy_distillation/run-qwen3-8B-token-kl-weighted_inverse-dapo17k.sh
+# Token-KL-Weighted OPSD on OpenThoughts
 #
-# Same algorithm as run-qwen3-8B-token-kl-weighted_inverse_0227.sh but trains
-# on the DAPO-Math-17k dataset (BytedanceResearch/DAPO-Math-17k).
+# Same algorithm as 0301 (competition) but trains on OpenThoughts dataset.
+# Eval on AIME 2024/2025, AMO Bench, HMMT 2025.
 #
-# Data preparation (first run only):
-#   python examples/on_policy_distillation/prepare_math.py \
-#       --download \
-#       --dataset BytedanceResearch/DAPO-Math-17k \
-#       --data-dir /root/data/dapo17k \
-#       [--hf-endpoint https://hf-mirror.com]   # optional China mirror
+# Data: train uses /root/data/openthoughts_train.jsonl
+#       eval uses aime2024, aime2025, amo_bench, hmmt2025
 
 # ---------------------------------------------------------------------------
 # Logging: tee all output (stdout + stderr) to a timestamped log file
@@ -43,7 +38,7 @@ source "/root/awesome-distillation/scripts/models/qwen3-8B.sh"
 
 # Use same path for save/load: enables auto-resume when checkpoint exists.
 # On first run (no checkpoint): falls back to ref-load, trains from scratch.
-CKPT_SAVE_DIR="/root/output/Qwen3-8B_token_kl_weighted_dapo17k"
+CKPT_SAVE_DIR="/root/output/Qwen3-8B_token_kl_weighted_inverse_openthoughts"
 CKPT_ARGS=(
    --hf-checkpoint /root/models/Qwen3-8B
    --ref-load "/root/models/Qwen3-8B_torch_dist"
@@ -54,12 +49,12 @@ CKPT_ARGS=(
 )
 
 ROLLOUT_ARGS=(
-   --prompt-data /root/data/dapo17k/train_opsd.jsonl
+   --prompt-data /root/data/openthoughts_train.jsonl
    --input-key prompt
    --label-key label
    --apply-chat-template
    --rollout-shuffle
-   --num-rollout 100
+   --num-rollout 200
    --rollout-batch-size 4
    --n-samples-per-prompt 8
    --rollout-max-response-len 2048
@@ -79,12 +74,15 @@ RM_ARGS=(
 
 EVAL_ARGS=(
     --eval-interval 5
-    --eval-config examples/on_policy_distillation/eval_config.yaml
+    --eval-prompt-data aime2024 /root/data/aime2024_eval.jsonl aime2025 /root/data/aime2025_eval.jsonl amo_bench /root/data/amo_bench_eval.jsonl hmmt2025 /root/data/hmmt2025_eval.jsonl
+    --eval-max-response-len 4096
+    --eval-top-p 1.0
+    --n-samples-per-eval-prompt 1
     --log-passrate
 )
 
 PERF_ARGS=(
-   --tensor-model-parallel-size 4
+   --tensor-model-parallel-size 1
    --sequence-parallel
    --pipeline-model-parallel-size 1
    --context-parallel-size 1
@@ -125,7 +123,7 @@ OPTIMIZER_ARGS=(
 WANDB_ARGS=(
    --use-wandb
    --wandb-project slime-dev
-   --wandb-group qwen3-8B-token-kl-weighted-inverse-dapo17k
+   --wandb-group qwen3-8B-token-kl-weighted-inverse-openthoughts
    --wandb-key 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
 )
 

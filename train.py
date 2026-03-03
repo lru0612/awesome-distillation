@@ -3,7 +3,7 @@ import ray
 from slime.ray.placement_group import create_placement_groups, create_rollout_manager, create_training_models
 from slime.utils.arguments import parse_args
 from slime.utils.logging_utils import configure_logger, init_tracking
-from slime.utils.misc import should_run_periodic_action
+from slime.utils.misc import prune_old_checkpoints, should_run_periodic_action
 
 
 def train(args):
@@ -52,6 +52,8 @@ def train(args):
                 rollout_id,
                 force_sync=rollout_id == args.num_rollout - 1,
             )
+            if args.save is not None and getattr(args, "max_save", None) is not None:
+                prune_old_checkpoints(args.save, args.max_save)
         if args.use_critic:
             critic_model.save_model(
                 rollout_id,

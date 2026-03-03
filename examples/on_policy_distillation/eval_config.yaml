@@ -4,6 +4,6 @@ eval:
     top_p: 1.0
   datasets:
     - name: math_test
-      path: /root/math/data/test_chat_eval.jsonl
+      path: /root/data/math/test_chat_eval.jsonl
       rm_type: math
       n_samples_per_eval_prompt: 1

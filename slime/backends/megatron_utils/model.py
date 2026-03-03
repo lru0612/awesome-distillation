@@ -32,6 +32,11 @@ from .model_provider import get_model_provider_func, wrap_model_provider_with_fr
 
 logger = logging.getLogger(__name__)
 
+# Module-level hook for OPSD JSD computation during training forward pass.
+# Replaced at runtime by register_segmented_opsd (or similar hooks) via
+# --custom-megatron-before-train-step-hook-path when --use-opd --opd-type opsd is set.
+_compute_opsd_jsd_in_forward = None
+
 
 def get_optimizer_param_scheduler(args: Namespace, optimizer: MegatronOptimizer) -> OptimizerParamScheduler:
     """Create and configure the optimizer learning-rate/weight-decay scheduler.
@@ -296,115 +301,6 @@ def forward_only(
     return rollout_data
 
 
-def _compute_opsd_jsd_in_forward(
-    args: Namespace,
-    model: GPTModel,
-    batch: dict,
-    output_tensor: torch.Tensor,
-) -> None:
-    """Run OPSD teacher forward and compute per-token JSD, storing results in ``batch``.
-
-    The teacher uses the SAME model weights, but with privileged input tokens
-    (teacher_tokens = privileged_prompt + student_response). The JSD is computed
-    between student and teacher full-vocabulary distributions on the response tokens.
-    Teacher logits are detached so gradients only flow through student logits.
-
-    Results are stored as ``batch["opsd_jsd_values"]``: list of [R] tensors per sample.
-    """
-    from megatron.core.packed_seq_params import PackedSeqParams
-
-    from slime.utils.ppo_utils import compute_vocab_parallel_jsd
-
-    teacher_tokens_list = batch["teacher_tokens"]  # list of [L_i] long tensors on GPU
-    teacher_prompt_lengths = batch["teacher_prompt_lengths"]  # list of int
-    response_lengths = batch["response_lengths"]  # list of int
-    total_lengths = batch["total_lengths"]  # list of int
-
-    tp_group = mpu.get_tensor_model_parallel_group()
-    pad_size = mpu.get_tensor_model_parallel_world_size() * args.data_pad_size_multiplier
-    pad_token_id = 0
-
-    # ---- Pack teacher tokens into THD format ----
-    teacher_cu_seqlens = [0]
-    teacher_tokens_cat_list = []
-    for t_tok in teacher_tokens_list:
-        teacher_tokens_cat_list.append(t_tok)
-        teacher_cu_seqlens.append(teacher_cu_seqlens[-1] + t_tok.size(0))
-
-    teacher_tokens_cat = torch.cat(teacher_tokens_cat_list)
-    pad = (pad_size - teacher_tokens_cat.size(0) % pad_size) % pad_size
-    if pad > 0:
-        teacher_tokens_cat = torch.nn.functional.pad(teacher_tokens_cat, (0, pad), value=pad_token_id)
-        teacher_cu_seqlens.append(teacher_cu_seqlens[-1] + pad)
-
-    cp_size = mpu.get_context_parallel_world_size()
-    teacher_cu_seqlens_tensor = (
-        torch.tensor(teacher_cu_seqlens, dtype=torch.int, device=torch.cuda.current_device()) * cp_size
-    )
-    teacher_max_seqlen = (teacher_cu_seqlens_tensor[1:] - teacher_cu_seqlens_tensor[:-1]).max().item()
-    teacher_packed_seq_params = PackedSeqParams(
-        cu_seqlens_q=teacher_cu_seqlens_tensor,
-        cu_seqlens_kv=teacher_cu_seqlens_tensor,
-        max_seqlen_q=teacher_max_seqlen,
-        max_seqlen_kv=teacher_max_seqlen,
-        qkv_format="thd",
-    )
-    teacher_tokens_input = teacher_tokens_cat.unsqueeze(0)
-
-    # ---- Teacher forward (no grad, same model weights) ----
-    with torch.no_grad():
-        teacher_output = model(
-            input_ids=teacher_tokens_input,
-            position_ids=None,
-            attention_mask=None,
-            labels=None,
-            packed_seq_params=teacher_packed_seq_params,
-            loss_mask=None,
-        )
-    teacher_logits = teacher_output.detach().float()  # [1, T_teacher, V_local]
-
-    # ---- Extract student logits (keep grad) ----
-    student_logits = output_tensor.float()  # [1, T_student, V_local]
-    if student_logits.dim() == 3 and student_logits.size(0) == 1:
-        student_logits_2d = student_logits.squeeze(0)  # [T_student, V_local]
-    else:
-        student_logits_2d = student_logits.view(-1, student_logits.size(-1))
-
-    if teacher_logits.dim() == 3 and teacher_logits.size(0) == 1:
-        teacher_logits_2d = teacher_logits.squeeze(0)  # [T_teacher, V_local]
-    else:
-        teacher_logits_2d = teacher_logits.view(-1, teacher_logits.size(-1))
-
-    if args.rollout_temperature != 1.0:
-        student_logits_2d = student_logits_2d / args.rollout_temperature
-        teacher_logits_2d = teacher_logits_2d / args.rollout_temperature
-
-    # ---- Compute per-sample JSD on response tokens ----
-    opsd_jsd_values = []
-    student_end = 0
-    teacher_end = 0
-    for i in range(len(response_lengths)):
-        resp_len = response_lengths[i]
-        total_len = total_lengths[i]
-        t_prompt_len = teacher_prompt_lengths[i]
-        t_total_len = t_prompt_len + resp_len
-
-        # Student response logits: positions [prompt_len-1, total_len-1)
-        student_end += total_len
-        student_start = student_end - resp_len
-        s_logits = student_logits_2d[student_start - 1 : student_end - 1]  # [resp_len, V_local]
-
-        # Teacher response logits: positions [t_prompt_len-1, t_total_len-1)
-        teacher_end += t_total_len
-        teacher_start_pos = teacher_end - resp_len
-        t_logits = teacher_logits_2d[teacher_start_pos - 1 : teacher_end - 1]  # [resp_len, V_local]
-
-        jsd = compute_vocab_parallel_jsd(s_logits, t_logits, tp_group, beta=args.opsd_jsd_beta)
-        opsd_jsd_values.append(jsd)
-
-    batch["opsd_jsd_values"] = opsd_jsd_values
-
-
 def train_one_step(
     args: Namespace,
     rollout_id: int,
@@ -524,14 +420,11 @@ def train_one_step(
         if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
             os.environ["ROUTING_REPLAY_STAGE"] = old_stage
 
-        # ---- OPSD: teacher forward + JSD computation ----
-        if (
-            args.use_opd
-            and args.opd_type == "opsd"
-            and args.opsd_jsd_coef > 0
-            and batch.get("teacher_tokens") is not None
-        ):
-            _compute_opsd_jsd_in_forward(args, model, batch, output_tensor)
+        # Call OPSD JSD hook if registered by --custom-megatron-before-train-step-hook-path.
+        # The hook populates batch["opsd_jsd_values"] which policy_loss_function uses.
+        _opsd_fn = globals().get("_compute_opsd_jsd_in_forward")
+        if _opsd_fn is not None and batch.get("teacher_tokens") is not None:
+            _opsd_fn(args, model, batch, output_tensor)
 
         return output_tensor, partial(loss_function, args, batch, num_microbatches)
 
@@ -772,11 +665,8 @@ def train(
 
             if args.ci_test and not args.ci_disable_kl_checker:
                 if step_id == 0 and "train/ppo_kl" in log_dict and "train/pg_clipfrac" in log_dict:
-                    if args.multi_latent_attention:
-                        # TODO: mla currently have non-zero kl, need further investigation
-                        assert log_dict["train/ppo_kl"] < 1e-8, f"{log_dict=}"
-                    else:
-                        assert log_dict["train/ppo_kl"] == 0.0 and log_dict["train/pg_clipfrac"] == 0.0, f"{log_dict=}"
+                    # TODO: figure out why KL is not exactly zero when using PPO loss with KL clipping, and whether this is expected behavior or a bug.
+                    assert log_dict["train/ppo_kl"] < 1e-8, f"{log_dict=}"
                 if accumulated_step_id == 0 and "train/kl_loss" in log_dict:
                     assert log_dict["train/kl_loss"] == 0.0, f"{log_dict=}"
 

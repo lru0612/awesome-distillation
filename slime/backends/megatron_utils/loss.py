@@ -847,6 +847,11 @@ def policy_loss_function(
         opsd_jsd = torch.cat(batch["opsd_jsd_values"], dim=0)
         reported_loss["opsd_jsd"] = sum_of_sample_mean(opsd_jsd).clone().detach()
 
+    # Add segmented OPSD diagnostic metrics (e.g. teacher entropy, KL weights)
+    for key, val in batch.items():
+        if key.startswith("seg_") and isinstance(val, torch.Tensor):
+            reported_loss[key] = val.detach()
+
     return loss, reported_loss
 
 

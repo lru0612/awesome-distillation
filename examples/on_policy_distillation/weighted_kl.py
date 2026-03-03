@@ -93,7 +93,7 @@ def entropy_to_confidence_weights(
 
     Supported modes:
 
-    * ``"inverse"``:  :math:`w_t = 1 / (1 + \tau \cdot H_t)`
+    * ``"inverse"``:  :math:`
     * ``"exp_neg"``:  :math:`w_t = \exp(-\tau \cdot H_t)`
     * ``"linear"``:   :math:`w_t = \max(0,\; 1 - \tau \cdot H_t)`
 
