@@ -992,7 +992,9 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help=(
                     "Type of on-policy distillation. "
                     "'sglang': Teacher log-probs are obtained from external SGLang server during rollout. "
-                    "'megatron': Teacher model is loaded via --opd-teacher-load and forwarded during training."
+                    "'megatron': Teacher model is loaded via --opd-teacher-load and forwarded during training. "
+                    "'opsd': On-Policy Self-Distillation same model acts as teacher with privileged prompt, "
+                    "using full-vocabulary JSD loss. Teacher tokens are constructed during rollout."
                 ),
             )
             parser.add_argument(
@@ -1006,7 +1008,29 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--opsd-jsd-coef",
                 type=float,
                 default=0.0,
-                help="Coefficient for full-vocabulary JSD loss in OPSD mode. Default is 0.0 (disabled).",
+                help="Coefficient for full-vocabulary distillation loss in OPSD mode. Default is 0.0 (disabled).",
+            )
+            parser.add_argument(
+                "--opsd-loss-type",
+                type=str,
+                choices=["jsd", "reverse_kl", "forward_kl", "wiener_kl"],
+                default="jsd",
+                help=(
+                    "Type of token-level distribution matching loss for OPSD. Default is 'jsd'. "
+                    "'jsd': Jensen-Shannon Divergence (symmetric), controlled by --opsd-jsd-beta. "
+                    "  m = beta*p_T + (1-beta)*p_S, loss = beta*KL(p_T||m) + (1-beta)*KL(p_S||m). "
+                    "'reverse_kl': KL(p_S || p_T) -- mode-seeking; student concentrates on teacher modes. "
+                    "  Gradient pushes student to avoid tokens the teacher ignores. "
+                    "'forward_kl': KL(p_T || p_S) -- mode-covering; student is penalised for missing teacher mass. "
+                    "  Equivalent to minimising NLL of teacher distribution under student. "
+                    "'wiener_kl': Parameter-free Wiener-style Trusted Self-Distillation. "
+                    "  Per-token gate w_t = [m_t]_+ / ([m_t]_+ + H_t^T + eps) where "
+                    "  m_t = log pi_T(y_t) - log pi_S(y_t) is the teacher-student margin at the "
+                    "  sampled token and H_t^T is the teacher entropy. "
+                    "  Loss = w_t * KL(pi_S || pi_T) + (1 - w_t) * KL(pi_T || pi_S). "
+                    "  Gate is large when teacher strongly supports y_t with low uncertainty. "
+                    "Note: --opsd-jsd-beta is only used when --opsd-loss-type=jsd."
+                ),
             )
             parser.add_argument(
                 "--opsd-jsd-beta",
@@ -1031,6 +1055,64 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             )
             parser.add_argument(
                 "--opd-teacher-ckpt-step", type=int, default=None, help="The checkpoint step for OPD teacher model."
+            )
+            parser.add_argument(
+                "--opsd-use-ref-as-teacher",
+                action="store_true",
+                default=False,
+                help=(
+                    "When enabled, OPSD teacher forward pass uses the REF model weights (loaded via --ref-load) "
+                    "instead of the current student model weights. This is equivalent to fixed_teacher=True in "
+                    "opsd_ucla: the teacher is the initial (step-0) policy and never updates, providing a stable "
+                    "distillation target throughout training. Recommended for reproducing paper results."
+                ),
+            )
+            parser.add_argument(
+                "--opsd-teacher-info-mode",
+                type=str,
+                choices=["full", "answer_only", "masked_reasoning", "conciseness", "pi"],
+                default="full",
+                help=(
+                    "Controls how much information the teacher receives in its privileged prompt, "
+                    "to study the effect of information density on OPSD. "
+                    "'full' (default): teacher receives the complete reference solution for step-by-step reasoning. "
+                    "'answer_only': teacher only receives the ground-truth final answer (no reasoning steps), "
+                    "reducing information density. "
+                    "'masked_reasoning': teacher receives the full reference solution, but during JSD computation "
+                    "the per-token JSD contributions on student reasoning tokens (inside <think>...</think>) are "
+                    "randomly zeroed out at rate --opsd-reasoning-mask-ratio, reducing the gradient signal "
+                    "from the reasoning portion. "
+                    "'conciseness': OPSDC mode (arXiv 2603.05433) -- teacher receives a conciseness instruction "
+                    "prepended to the original problem; NO ground-truth solution is needed. "
+                    "Use with --opsd-loss-type=reverse_kl and --opsd-pure-mode for full OPSDC training."
+                ),
+            )
+            parser.add_argument(
+                "--opsd-reasoning-mask-ratio",
+                type=float,
+                default=0.5,
+                help=(
+                    "Fraction of reasoning tokens (inside <think>...</think> in the student response) whose JSD "
+                    "contribution is randomly masked to zero when --opsd-teacher-info-mode=masked_reasoning. "
+                    "0.0 means no masking (equivalent to 'full' mode), 1.0 masks all reasoning tokens. "
+                    "Default is 0.5."
+                ),
+            )
+            parser.add_argument(
+                "--opsd-conciseness-instruction",
+                type=str,
+                default=(
+                    "Solve the following math problem concisely and correctly. "
+                    "Be direct -- avoid unnecessary elaboration, redundant steps, or restating the problem. "
+                    "Focus only on the key reasoning steps needed to reach the answer."
+                ),
+                help=(
+                    "Conciseness instruction prepended to the teacher prompt when "
+                    "--opsd-teacher-info-mode=conciseness. "
+                    "The teacher sees this instruction + the original problem; "
+                    "the student sees only the original problem. "
+                    "Used by OPSDC (arXiv 2603.05433) for ground-truth-free reasoning compression."
+                ),
             )
             return parser
 
@@ -1454,6 +1536,8 @@ def _pre_parse_mode():
     registering them twice.  The returned namespace is merged into
     the final ``args`` after Phase 2 parsing.
     """
+    # Disable long-option abbreviation so `--load` won't be parsed as
+    # `--load-debug-rollout-data` in this lightweight pre-parser.
     temp_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     temp_parser.add_argument("--train-backend", type=str, choices=["megatron", "fsdp"], default="megatron")
     temp_parser.add_argument("--debug-rollout-only", action="store_true", default=False)
@@ -1491,7 +1575,7 @@ def parse_args(add_custom_arguments=None):
         )
     else:
         logger.warning(
-            "🚧 🚧 🚧 FSDP backend is being rewritten, please use Megatron backend for better stability. 🚧 🚧 🚧"
+            "?? ?? ?? FSDP backend is being rewritten, please use Megatron backend for better stability. ?? ?? ??"
         )
 
         from slime.backends.fsdp_utils.arguments import fsdp_parse_args

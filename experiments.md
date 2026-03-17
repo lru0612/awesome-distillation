@@ -1,0 +1,2 @@
+1. 使得ref model有两个: 一个是teacher ref需要定时更新权重(或者如果是ema则应该不用)且prompt里面有priviledge information，另一个是ppo/grpo里面的ref model，这个是固定的权重，prompt和student的prompt一样
+2. 测试不同的priviledge information的影响。有两种:第一种是每个问题有自己的priviledge information，第二种是所有问题的priviledge information相同(prompt internalization)

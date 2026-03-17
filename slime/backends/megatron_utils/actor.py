@@ -32,7 +32,7 @@ from .cp_utils import slice_log_prob_with_cp, slice_with_cp
 from .data import DataIterator, get_data_iterator, log_perf_data, log_rollout_data, sync_actor_critic_data
 from .initialize import init, is_megatron_main_rank
 from .loss import compute_advantages_and_returns, get_log_probs_and_entropy, get_values
-from .model import forward_only, initialize_model_and_optimizer, save, train
+from .model import forward_only, initialize_model_and_optimizer, save, set_opsd_weights_backuper, train
 from .update_weight.common import named_params_and_buffers
 from .update_weight.update_weight_from_distributed import UpdateWeightFromDistributed
 from .update_weight.update_weight_from_tensor import UpdateWeightFromTensor
@@ -154,6 +154,16 @@ class MegatronTrainRayActor(TrainRayActor):
             self.rollout_data_postprocess = load_function(self.args.rollout_data_postprocess_path)
 
         self.prof.on_init_end()
+
+        # Register weights_backuper for OPSD fixed-teacher support.
+        # This allows _compute_opsd_jsd_in_forward to temporarily swap to ref
+        # weights when --opsd-use-ref-as-teacher is enabled.
+        if getattr(args, "opsd_use_ref_as_teacher", False):
+            if "ref" not in self.weights_backuper.backup_tags:
+                raise ValueError(
+                    "--opsd-use-ref-as-teacher requires a ref model (--ref-load must be set)."
+                )
+            set_opsd_weights_backuper(self.weights_backuper)
 
         return start_rollout_id
 

@@ -1,6 +1,7 @@
 import aiohttp
 import torch
 
+from slime.rollout.rm_hub import grade_answer_verl
 from slime.utils.types import Sample
 
 
@@ -20,7 +21,14 @@ async def reward_func(args, sample, **kwargs):
     async with aiohttp.ClientSession(**session_kwargs) as session:
         async with session.post(args.rm_url, json=payload) as resp:
             resp.raise_for_status()
-            return await resp.json()
+            teacher_output = await resp.json()
+
+    # Accuracy is used for logging/eval metrics; training reward remains zero in post_process_rewards.
+    accuracy = 1.0 if grade_answer_verl(sample.response or "", sample.label or "") else 0.0
+    return {
+        "teacher_output": teacher_output,
+        "accuracy": accuracy,
+    }
 
 
 def post_process_rewards(args, samples: list[Sample], **kwargs):
@@ -36,13 +44,25 @@ def post_process_rewards(args, samples: list[Sample], **kwargs):
     For pure on-policy distillation without task rewards, we return 0.0 for each sample.
     The actual learning signal comes from the OPD KL penalty applied in compute_advantages_and_returns.
     """
-    raw_rewards = [sample.get_reward_value(args) for sample in samples]
+    raw_rewards = []
     response_lengths = [sample.response_length for sample in samples]
+
+    teacher_outputs = []
+    for sample in samples:
+        reward = sample.reward
+        if isinstance(reward, dict) and "teacher_output" in reward:
+            teacher_output = reward["teacher_output"]
+            raw_rewards.append(float(reward.get("accuracy", 0.0)))
+        else:
+            # Backward-compatible path for historical checkpoints/scripts.
+            teacher_output = reward
+            raw_rewards.append(0.0)
+        teacher_outputs.append(teacher_output)
 
     # Extract teacher log-probs from the sglang response
     teacher_log_probs = [
         torch.tensor([item[0] for item in reward["meta_info"]["input_token_logprobs"][1:]], dtype=torch.float32)
-        for reward in raw_rewards
+        for reward in teacher_outputs
     ]
     teacher_log_probs = [
         t_log_prob[-response_length:]
@@ -58,4 +78,4 @@ def post_process_rewards(args, samples: list[Sample], **kwargs):
     # If you have task rewards, you can add them here.
     scalar_rewards = [0.0] * len(samples)
 
-    return scalar_rewards, scalar_rewards
+    return raw_rewards, scalar_rewards

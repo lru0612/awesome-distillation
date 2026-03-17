@@ -32,10 +32,19 @@ from .model_provider import get_model_provider_func, wrap_model_provider_with_fr
 
 logger = logging.getLogger(__name__)
 
-# Module-level hook for OPSD JSD computation during training forward pass.
-# Replaced at runtime by register_segmented_opsd (or similar hooks) via
-# --custom-megatron-before-train-step-hook-path when --use-opd --opd-type opsd is set.
-_compute_opsd_jsd_in_forward = None
+# ---------------------------------------------------------------------------
+# OPSD fixed-teacher support
+# ---------------------------------------------------------------------------
+# When --opsd-use-ref-as-teacher is enabled, the actor injects its
+# TensorBackuper here so that _compute_opsd_jsd_in_forward can temporarily
+# swap in the ref weights for the teacher forward pass.
+_opsd_weights_backuper = None
+
+
+def set_opsd_weights_backuper(backuper) -> None:
+    """Register the actor's TensorBackuper for OPSD fixed-teacher support."""
+    global _opsd_weights_backuper
+    _opsd_weights_backuper = backuper
 
 
 def get_optimizer_param_scheduler(args: Namespace, optimizer: MegatronOptimizer) -> OptimizerParamScheduler:
@@ -301,6 +310,271 @@ def forward_only(
     return rollout_data
 
 
+def _compute_opsd_jsd_in_forward(
+    args: Namespace,
+    model: GPTModel,
+    batch: dict,
+    output_tensor: torch.Tensor,
+    teacher_model: GPTModel | None = None,
+) -> None:
+    """Run OPSD teacher forward and compute per-token distribution-matching loss, storing results in ``batch``.
+
+    The teacher uses the SAME model weights, but with privileged input tokens
+    (teacher_tokens = privileged_prompt + student_response). The per-token loss is
+    computed between student and teacher full-vocabulary distributions on the response
+    tokens. Teacher logits are detached so gradients only flow through student logits.
+
+    Loss type is controlled by ``args.opsd_loss_type``:
+      - ``'jsd'`` (default): Jensen-Shannon Divergence, symmetric, uses ``args.opsd_jsd_beta``.
+      - ``'reverse_kl'``: KL(p_S || p_T), mode-seeking.
+      - ``'forward_kl'``: KL(p_T || p_S), mode-covering.
+
+    To keep memory bounded, the loss can be computed in sequence chunks (reusing
+    ``args.log_probs_chunk_size`` if available), avoiding full-sequence fp32
+    temporary tensors.
+
+    Results are stored as ``batch["opsd_jsd_values"]``: list of [R] tensors per sample.
+    """
+    from megatron.core.packed_seq_params import PackedSeqParams
+
+    from slime.utils.ppo_utils import (
+        compute_vocab_parallel_forward_kl,
+        compute_vocab_parallel_jsd,
+        compute_vocab_parallel_reverse_kl,
+        compute_vocab_parallel_wiener_kl,
+    )
+
+    loss_type = getattr(args, "opsd_loss_type", "jsd")
+
+    teacher_tokens_list = batch["teacher_tokens"]  # list of [L_i] long tensors on GPU
+    teacher_prompt_lengths = batch["teacher_prompt_lengths"]  # list of int
+    response_lengths = batch["response_lengths"]  # list of int
+    total_lengths = batch["total_lengths"]  # list of int
+
+    tp_group = mpu.get_tensor_model_parallel_group()
+    pad_size = mpu.get_tensor_model_parallel_world_size() * args.data_pad_size_multiplier
+    pad_token_id = 0
+
+    # ---- Pack teacher tokens into THD format ----
+    teacher_cu_seqlens = [0]
+    teacher_tokens_cat_list = []
+    for t_tok in teacher_tokens_list:
+        teacher_tokens_cat_list.append(t_tok)
+        teacher_cu_seqlens.append(teacher_cu_seqlens[-1] + t_tok.size(0))
+
+    teacher_tokens_cat = torch.cat(teacher_tokens_cat_list)
+    pad = (pad_size - teacher_tokens_cat.size(0) % pad_size) % pad_size
+    if pad > 0:
+        teacher_tokens_cat = torch.nn.functional.pad(teacher_tokens_cat, (0, pad), value=pad_token_id)
+        teacher_cu_seqlens.append(teacher_cu_seqlens[-1] + pad)
+
+    cp_size = mpu.get_context_parallel_world_size()
+    teacher_cu_seqlens_tensor = (
+        torch.tensor(teacher_cu_seqlens, dtype=torch.int, device=torch.cuda.current_device()) * cp_size
+    )
+    teacher_max_seqlen = (teacher_cu_seqlens_tensor[1:] - teacher_cu_seqlens_tensor[:-1]).max().item()
+    teacher_packed_seq_params = PackedSeqParams(
+        cu_seqlens_q=teacher_cu_seqlens_tensor,
+        cu_seqlens_kv=teacher_cu_seqlens_tensor,
+        max_seqlen_q=teacher_max_seqlen,
+        max_seqlen_kv=teacher_max_seqlen,
+        qkv_format="thd",
+    )
+    teacher_tokens_input = teacher_tokens_cat.unsqueeze(0)
+
+    # ---- Teacher forward: done BEFORE student forward (via _prefetch_opsd_teacher_logits) ----
+    # We must NOT do weight swap here (after student forward) as it would invalidate
+    # the autograd saved_tensors version numbers from the student forward pass.
+    # Teacher logits should already be in batch["_opsd_teacher_logits_prefetched"].
+    teacher_logits = batch.pop("_opsd_teacher_logits_prefetched", None)
+    if teacher_logits is None:
+        # Fallback: dynamic teacher (use current model, no weight swap)
+        with torch.no_grad():
+            teacher_output = model(
+                input_ids=teacher_tokens_input,
+                position_ids=None,
+                attention_mask=None,
+                labels=None,
+                packed_seq_params=teacher_packed_seq_params,
+                loss_mask=None,
+            )
+        teacher_logits = teacher_output.detach()
+        del teacher_output
+
+    # ---- Extract student logits (keep grad) ----
+    student_logits = output_tensor  # [1, T_student, V_local]
+    if student_logits.dim() == 3 and student_logits.size(0) == 1:
+        student_logits_2d = student_logits.squeeze(0)  # [T_student, V_local]
+    else:
+        student_logits_2d = student_logits.view(-1, student_logits.size(-1))
+
+    if teacher_logits.dim() == 3 and teacher_logits.size(0) == 1:
+        teacher_logits_2d = teacher_logits.squeeze(0)  # [T_teacher, V_local]
+    else:
+        teacher_logits_2d = teacher_logits.view(-1, teacher_logits.size(-1))
+
+    jsd_chunk_size = getattr(args, "opsd_jsd_chunk_size", -1)
+    if jsd_chunk_size is None or jsd_chunk_size <= 0:
+        jsd_chunk_size = getattr(args, "log_probs_chunk_size", -1)
+    temperature = float(args.rollout_temperature)
+
+    # ---- Compute per-sample JSD on response tokens ----
+    opsd_jsd_values = []
+    opsd_wiener_weights = []  # only populated when loss_type == "wiener_kl"
+    student_end = 0
+    teacher_end = 0
+    for i in range(len(response_lengths)):
+        resp_len = response_lengths[i]
+        total_len = total_lengths[i]
+        t_prompt_len = teacher_prompt_lengths[i]
+        t_total_len = t_prompt_len + resp_len
+
+        # Student response logits: positions [prompt_len-1, total_len-1)
+        student_end += total_len
+        student_start = student_end - resp_len
+        s_logits = student_logits_2d[student_start - 1 : student_end - 1]  # [resp_len, V_local]
+
+        # Teacher response logits: positions [t_prompt_len-1, t_total_len-1)
+        teacher_end += t_total_len
+        teacher_start_pos = teacher_end - resp_len
+        t_logits = teacher_logits_2d[teacher_start_pos - 1 : teacher_end - 1]  # [resp_len, V_local]
+
+        # Response tokens for wiener_kl gate: last resp_len tokens of the teacher sequence
+        # (teacher_tokens = privileged_prompt + student_response, so [t_prompt_len:] = response)
+        response_tokens_i = teacher_tokens_list[i][t_prompt_len : t_prompt_len + resp_len]  # [resp_len]
+
+        # Per-sample wiener gate accumulator (wiener_kl only).
+        wiener_w_chunks = []
+
+        # Compute distribution-matching loss on smaller chunks to cap peak memory.
+        def _compute_loss_chunk(
+            s_chunk: torch.Tensor,
+            t_chunk: torch.Tensor,
+            tok_chunk: torch.Tensor | None = None,
+        ) -> torch.Tensor:
+            """Dispatch to the configured per-chunk loss function."""
+            if s_chunk.dtype != torch.float32:
+                s_chunk = s_chunk.float()
+            if t_chunk.dtype != torch.float32:
+                t_chunk = t_chunk.float()
+            if temperature != 1.0:
+                s_chunk = s_chunk / temperature
+                t_chunk = t_chunk / temperature
+            if loss_type == "reverse_kl":
+                return compute_vocab_parallel_reverse_kl(s_chunk, t_chunk, tp_group)
+            elif loss_type == "forward_kl":
+                return compute_vocab_parallel_forward_kl(s_chunk, t_chunk, tp_group)
+            elif loss_type == "wiener_kl":
+                assert tok_chunk is not None, "wiener_kl requires response_tokens"
+                chunk_loss, w = compute_vocab_parallel_wiener_kl(s_chunk, t_chunk, tok_chunk, tp_group)
+                wiener_w_chunks.append(w.detach())
+                return chunk_loss
+            else:  # default: jsd
+                return compute_vocab_parallel_jsd(s_chunk, t_chunk, tp_group, beta=args.opsd_jsd_beta)
+
+        if jsd_chunk_size is not None and jsd_chunk_size > 0 and resp_len > jsd_chunk_size:
+            loss_chunks = []
+            for chunk_start in range(0, resp_len, jsd_chunk_size):
+                chunk_end = min(chunk_start + jsd_chunk_size, resp_len)
+                tok_chunk = response_tokens_i[chunk_start:chunk_end] if loss_type == "wiener_kl" else None
+                loss_chunks.append(_compute_loss_chunk(
+                    s_logits[chunk_start:chunk_end],
+                    t_logits[chunk_start:chunk_end],
+                    tok_chunk,
+                ))
+            jsd = torch.cat(loss_chunks, dim=0)
+        else:
+            tok_arg = response_tokens_i if loss_type == "wiener_kl" else None
+            jsd = _compute_loss_chunk(s_logits, t_logits, tok_arg)
+
+        if wiener_w_chunks:
+            opsd_wiener_weights.append(torch.cat(wiener_w_chunks, dim=0))
+        opsd_jsd_values.append(jsd)
+
+    batch["opsd_jsd_values"] = opsd_jsd_values
+    if opsd_wiener_weights:
+        batch["opsd_wiener_weights"] = opsd_wiener_weights
+
+
+def _prefetch_opsd_teacher_logits(
+    args: Namespace,
+    model: GPTModel,
+    batch: dict,
+) -> None:
+    """Run teacher forward pass BEFORE the student forward to avoid in-place weight-swap
+    invalidating autograd saved_tensors version numbers.
+
+    When --opsd-use-ref-as-teacher is set, temporarily swap model weights to the ref
+    (step-0) policy, run the teacher forward under no_grad, then restore actor weights.
+    The result is stored in ``batch["_opsd_teacher_logits_prefetched"]`` for later use
+    by ``_compute_opsd_jsd_in_forward``.
+
+    IMPORTANT: This must be called BEFORE ``model(**student_forward_kwargs)`` so that
+    the weight restore happens before PyTorch autograd saves any tensor versions.
+    """
+    from megatron.core.packed_seq_params import PackedSeqParams
+
+    teacher_tokens_list = batch["teacher_tokens"]
+    teacher_cu_seqlens_raw = batch.get("teacher_cu_seqlens_prefetch", None)
+
+    tp_group = mpu.get_tensor_model_parallel_group()
+    pad_size = mpu.get_tensor_model_parallel_world_size() * args.data_pad_size_multiplier
+    pad_token_id = 0
+
+    # Pack teacher tokens (same logic as in _compute_opsd_jsd_in_forward)
+    teacher_cu_seqlens = [0]
+    teacher_tokens_cat_list = []
+    for t_tok in teacher_tokens_list:
+        teacher_tokens_cat_list.append(t_tok)
+        teacher_cu_seqlens.append(teacher_cu_seqlens[-1] + t_tok.size(0))
+
+    teacher_tokens_cat = torch.cat(teacher_tokens_cat_list)
+    pad = (pad_size - teacher_tokens_cat.size(0) % pad_size) % pad_size
+    if pad > 0:
+        teacher_tokens_cat = torch.nn.functional.pad(teacher_tokens_cat, (0, pad), value=pad_token_id)
+        teacher_cu_seqlens.append(teacher_cu_seqlens[-1] + pad)
+
+    cp_size = mpu.get_context_parallel_world_size()
+    teacher_cu_seqlens_tensor = (
+        torch.tensor(teacher_cu_seqlens, dtype=torch.int, device=torch.cuda.current_device()) * cp_size
+    )
+    teacher_max_seqlen = (teacher_cu_seqlens_tensor[1:] - teacher_cu_seqlens_tensor[:-1]).max().item()
+    teacher_packed_seq_params = PackedSeqParams(
+        cu_seqlens_q=teacher_cu_seqlens_tensor,
+        cu_seqlens_kv=teacher_cu_seqlens_tensor,
+        max_seqlen_q=teacher_max_seqlen,
+        max_seqlen_kv=teacher_max_seqlen,
+        qkv_format="thd",
+    )
+    teacher_tokens_input = teacher_tokens_cat.unsqueeze(0)
+
+    # Weight swap → teacher forward → restore  (all before student forward)
+    use_ref_teacher = (
+        getattr(args, "opsd_use_ref_as_teacher", False)
+        and _opsd_weights_backuper is not None
+        and "ref" in _opsd_weights_backuper.backup_tags
+    )
+    if use_ref_teacher:
+        _opsd_weights_backuper.restore("ref")
+    try:
+        with torch.no_grad():
+            teacher_output = model(
+                input_ids=teacher_tokens_input,
+                position_ids=None,
+                attention_mask=None,
+                labels=None,
+                packed_seq_params=teacher_packed_seq_params,
+                loss_mask=None,
+            )
+    finally:
+        if use_ref_teacher:
+            _opsd_weights_backuper.restore("actor")
+
+    # Store for use by _compute_opsd_jsd_in_forward (called after student forward)
+    batch["_opsd_teacher_logits_prefetched"] = teacher_output.detach()
+    del teacher_output
+
+
 def train_one_step(
     args: Namespace,
     rollout_id: int,
@@ -389,6 +663,17 @@ def train_one_step(
             old_stage = os.environ["ROUTING_REPLAY_STAGE"]
             os.environ["ROUTING_REPLAY_STAGE"] = "replay_forward"
 
+        # ---- OPSD: teacher forward BEFORE student (to avoid autograd version mismatch) ----
+        # Weight swap (ref → actor) must happen before model(**forward_kwargs) saves
+        # tensor versions into ctx.saved_tensors. Teacher logits are stored in batch.
+        if (
+            args.use_opd
+            and args.opd_type == "opsd"
+            and args.opsd_jsd_coef > 0
+            and batch.get("teacher_tokens") is not None
+        ):
+            _prefetch_opsd_teacher_logits(args, model, batch)
+
         if return_schedule_plan:
             assert not args.enable_mtp_training, "MTP training should not be enabled when using combined 1f1b"
             output_tensor = model.build_schedule_plan(
@@ -420,11 +705,14 @@ def train_one_step(
         if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
             os.environ["ROUTING_REPLAY_STAGE"] = old_stage
 
-        # Call OPSD JSD hook if registered by --custom-megatron-before-train-step-hook-path.
-        # The hook populates batch["opsd_jsd_values"] which policy_loss_function uses.
-        _opsd_fn = globals().get("_compute_opsd_jsd_in_forward")
-        if _opsd_fn is not None and batch.get("teacher_tokens") is not None:
-            _opsd_fn(args, model, batch, output_tensor)
+        # ---- OPSD: JSD computation AFTER student forward (teacher logits already prefetched) ----
+        if (
+            args.use_opd
+            and args.opd_type == "opsd"
+            and args.opsd_jsd_coef > 0
+            and batch.get("teacher_tokens") is not None
+        ):
+            _compute_opsd_jsd_in_forward(args, model, batch, output_tensor)
 
         return output_tensor, partial(loss_function, args, batch, num_microbatches)
 

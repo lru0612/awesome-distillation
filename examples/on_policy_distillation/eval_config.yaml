@@ -1,9 +1,41 @@
+# NOTE: In-training eval shares the same apply_chat_template_kwargs as training rollout.
+# Because rollout uses enable_thinking=false (to match the original opsd_ucla paper config),
+# this in-training eval also runs in NON-THINKING mode and should only be used as a trend indicator.
+#
+# For final benchmark evaluation matching the paper results, use opsd_ucla/eval/evaluate_math.py
+# WITHOUT --no_thinking (default enable_thinking=True, max_new_tokens=38912).
 eval:
   defaults:
-    max_response_len: 2048
-    top_p: 1.0
+    max_response_len: 16384
+    top_p: 0.95
   datasets:
-    - name: math_test
-      path: /root/data/math/test_chat_eval.jsonl
+    # - name: aime24
+    #   path: /root/math/data/eval_aime24.jsonl
+    #   rm_type: math
+    #   n_samples_per_eval_prompt: 1
+    #   apply_chat_template_kwargs:
+    #     enable_thinking: true
+    # - name: aime25
+    #   path: /root/math/data/eval_aime25.jsonl
+    #   rm_type: math
+    #   n_samples_per_eval_prompt: 1
+    #   apply_chat_template_kwargs:
+    #     enable_thinking: true
+    # - name: hmmt
+    #   path: /root/math/data/eval_hmmt.jsonl
+    #   rm_type: math
+    #   n_samples_per_eval_prompt: 1
+    #   apply_chat_template_kwargs:
+    #     enable_thinking: true
+    # - name: amo_bench
+    #   path: /root/math/data/eval_amo_bench.jsonl
+    #   rm_type: math
+    #   n_samples_per_eval_prompt: 1
+    #   apply_chat_template_kwargs:
+    #     enable_thinking: true
+    - name: math500
+      path: /root/math/data/eval_math500.jsonl
       rm_type: math
       n_samples_per_eval_prompt: 1
+      apply_chat_template_kwargs:
+        enable_thinking: false

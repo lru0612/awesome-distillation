@@ -151,7 +151,7 @@ def create_training_models(args, pgs, rollout_manager):
         actor_model.async_init(
             args,
             role="actor",
-            with_ref=args.kl_coef != 0 or args.use_kl_loss,
+            with_ref=args.kl_coef != 0 or args.use_kl_loss or getattr(args, "opsd_use_ref_as_teacher", False),
             with_opd_teacher=args.use_opd and args.opd_type == "megatron",
         )
     )

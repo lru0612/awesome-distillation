@@ -1122,6 +1122,9 @@ def _resolve_sglang_config(args) -> SglangConfig:
     )
 
 
+_COMBINED_EVAL_KEYS = {"aime24", "aime25", "hmmt", "amo_bench"}
+
+
 def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any] | None = None):
     if args.custom_eval_rollout_log_function_path is not None:
         custom_log_func = load_function(args.custom_eval_rollout_log_function_path)
@@ -1129,6 +1132,7 @@ def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any]
             return
 
     log_dict = extra_metrics or {}
+    combined_rewards: list[float] = []
     for key in data.keys():
         rewards = data[key]["rewards"]
         log_dict[f"eval/{key}"] = sum(rewards) / len(rewards)
@@ -1144,6 +1148,19 @@ def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any]
                     group_size=args.n_samples_per_eval_prompt,
                 ),
                 f"eval/{key}-",
+            )
+        if key in _COMBINED_EVAL_KEYS:
+            combined_rewards.extend(rewards)
+
+    if combined_rewards:
+        log_dict["eval/combined"] = sum(combined_rewards) / len(combined_rewards)
+        if args.log_passrate:
+            log_dict |= dict_add_prefix(
+                compute_pass_rate(
+                    flat_rewards=combined_rewards,
+                    group_size=args.n_samples_per_eval_prompt,
+                ),
+                "eval/combined-",
             )
 
     logger.info(f"eval {rollout_id}: {log_dict}")

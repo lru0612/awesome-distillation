@@ -1,0 +1,49 @@
+# Eval config for the Prompt Internalization safety experiment.
+#
+# Evaluation datasets:
+#   beavertails_test   — BeaverTails 30k-test (medium difficulty, mixed harm categories)
+#   wildguardtest      — WildGuardMix test set (hard, adversarial jailbreaks)
+#
+# Reward type: "safety" → slime/rollout/rm_hub/safety.py::compute_safety_reward
+#
+# Judge mode is read from metadata['judge_mode'] (set by preprocess_pi_safety.py).
+# Default: "keyword" (fast rule-based).
+# To use LLM judge, set env vars before training:
+#   export JUDGE_MODE=llm
+#   export JUDGE_API_BASE=http://localhost:8000/v1
+#   export JUDGE_API_KEY=EMPTY
+#   export JUDGE_MODEL=Qwen/Qwen3-8B
+# or pass --judge-mode llm to preprocess_pi_safety.py when building the eval JSONL.
+#
+# Preprocessing (run once):
+#   python examples/prompt_internalization/preprocess_pi_safety.py \
+#       --dataset PKU-Alignment/BeaverTails --split 30k-test \
+#       --output /root/pi_safety/eval_beavertails.jsonl
+#
+#   python examples/prompt_internalization/preprocess_pi_safety.py \
+#       --dataset allenai/wildguardmix --config wildguardtest --split test \
+#       --output /root/pi_safety/eval_wildguardtest.jsonl --judge-mode llm
+
+eval:
+  defaults:
+    max_response_len: 4096
+    top_p: 0.95
+  datasets:
+    # - name: beavertails_test
+    #   path: /root/slime_siqi/data/pi_safety/eval_beavertails.jsonl
+    #   rm_type: safety
+    #   n_samples_per_eval_prompt: 1
+    #   apply_chat_template_kwargs:
+    #     enable_thinking: false
+    # - name: wildguardtest
+    #   path: /root/slime_siqi/data/pi_safety/eval_wildguardtest.jsonl
+    #   rm_type: safety
+    #   n_samples_per_eval_prompt: 1
+    #   apply_chat_template_kwargs:
+    #     enable_thinking: false
+    - name: bullshit_benchmark
+      path: /root/slime_siqi/data/pi_safety/eval_bullshit.jsonl
+      rm_type: bullshit
+      n_samples_per_eval_prompt: 1
+      apply_chat_template_kwargs:
+        enable_thinking: false

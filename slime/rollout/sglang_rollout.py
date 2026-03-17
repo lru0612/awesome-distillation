@@ -487,7 +487,13 @@ async def eval_rollout_single_dataset(
             metadata_key=dataset_cfg.metadata_key,
             tool_key=dataset_cfg.tool_key,
             apply_chat_template=args.apply_chat_template,
-            apply_chat_template_kwargs=args.apply_chat_template_kwargs,
+            # Per-dataset kwargs override the global --apply-chat-template-kwargs.
+            # This lets eval use a different template (e.g. enable_thinking=true) than rollout.
+            apply_chat_template_kwargs=(
+                dataset_cfg.apply_chat_template_kwargs
+                if dataset_cfg.apply_chat_template_kwargs is not None
+                else args.apply_chat_template_kwargs
+            ),
         )
     dataset = EVAL_PROMPT_DATASET[cache_key]
 

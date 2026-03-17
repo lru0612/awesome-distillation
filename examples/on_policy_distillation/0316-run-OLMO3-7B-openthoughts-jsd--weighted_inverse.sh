@@ -2,30 +2,16 @@
 
 # OPSD (JSD, token-KL inverse weighted) on DAPO-Math-17k + OpenThoughts mixed dataset, with OLMo3-7B
 #
-# Algorithm: segmented OPSD with symmetric JSD loss (opsd-jsd-beta 0.5).
-#   Token-level KL weighting: inverse (KL_WEIGHT_MODE=inverse), down-weights high-KL tokens.
-#   Segment weighting: uniform.
+# Algorithm: OPSD with symmetric JSD loss (opsd-jsd-beta 0.5).
+#   JSD(p_T, p_S) = 0.5·KL(p_T‖m) + 0.5·KL(p_S‖m), m = 0.5·p_T + 0.5·p_S
+# Token-level KL weighting: inverse (KL_WEIGHT_MODE=inverse), down-weights high-KL tokens.
 #
 # Training data: DAPO-Math-17k + OpenThoughts merged into a single jsonl.
 # Eval: AIME 2024, AIME 2025, HMMT 2025, AMO Bench
 #
-# GPU: 4 × 90 GB  (2 actor GPUs + 2 rollout GPUs)
+# GPU: 4 × 90 GB  (colocate: rollout + training on same 4 GPUs)
 #
-# ---------------------------------------------------------------------------
-# Data preparation (first run only):
-#
-#   # 1. Prepare DAPO-Math-17k
-#   python examples/on_policy_distillation/data_prepare/prepare_dapo.py \
-#       --mode train --num-samples 17000 \
-#       --output /root/data/dapo_train.jsonl --seed 42
-#
-#   # 2. OpenThoughts is expected at /root/data/openthoughts_train.jsonl
-#   #    (prepared separately, same format as DAPO train output above)
-#
-#   # 3. Merge both files into a single training file
-#   cat /root/data/dapo_train.jsonl /root/data/openthoughts_train.jsonl \
-#       > /root/data/dapo_openthoughts_mixed_train.jsonl
-# ---------------------------------------------------------------------------
+# Usage: bash examples/on_policy_distillation/0316-run-OLMO3-7B-openthoughts-jsd--weighted_inverse.sh
 
 # ---------------------------------------------------------------------------
 # Logging: tee all output (stdout + stderr) to a timestamped log file
@@ -58,10 +44,36 @@ REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." &>/dev/null && pwd)"
 source "${REPO_ROOT}/scripts/models/olmo3-7B.sh"
 
 ###############################################################################
+# Step 0: Preprocess datasets
+###############################################################################
+
+PREPROCESS="python3 examples/on_policy_distillation/preprocess_dataset.py"
+ANSWER_FORMAT="${ANSWER_FORMAT:-boxed}"
+
+# ---- OpenThoughts training data ---------------------------------------------
+$PREPROCESS --dataset open-thoughts/OpenThoughts-114k --config metadata --split train \
+    --output /root/math/data/train_openthoughts.jsonl --answer-format "$ANSWER_FORMAT"
+
+# ---- DAPO-Math-17k training data --------------------------------------------
+# $PREPROCESS --dataset math-ai/DAPO-Math-17k --split train \
+#     --output /root/math/data/train_dapo.jsonl --answer-format "$ANSWER_FORMAT"
+
+# ---- Merge into mixed training file -----------------------------------------
+# cat /root/math/data/train_dapo.jsonl /root/math/data/train_openthoughts.jsonl \
+#     > /root/math/data/train_dapo_openthoughts_mixed.jsonl
+
+# ---- Eval datasets ----------------------------------------------------------
+$PREPROCESS --dataset math-ai/aime24             --split test  --output /root/math/data/eval_aime24.jsonl    --answer-format "$ANSWER_FORMAT"
+$PREPROCESS --dataset math-ai/aime25             --split test  --output /root/math/data/eval_aime25.jsonl    --answer-format "$ANSWER_FORMAT"
+$PREPROCESS --dataset FlagEval/HMMT_2025         --split train --output /root/math/data/eval_hmmt.jsonl      --answer-format "$ANSWER_FORMAT"
+$PREPROCESS --dataset meituan-longcat/AMO-Bench  --split test  --output /root/math/data/eval_amo_bench.jsonl --answer-format "$ANSWER_FORMAT"
+$PREPROCESS --dataset HuggingFaceH4/MATH-500     --split test  --output /root/math/data/eval_math500.jsonl   --answer-format "$ANSWER_FORMAT"
+
+###############################################################################
 # Training arguments
 ###############################################################################
 
-CKPT_SAVE_DIR="/root/output/OLMo3-7B_opsd_dapo_openthoughts"
+CKPT_SAVE_DIR="/root/output/OLMo3-7B_opsd_jsd_weighted_inverse_openthoughts"
 CKPT_ARGS=(
    --hf-checkpoint /root/models/Olmo-3-7B-Instruct
    --ref-load "/root/models/Olmo-3-7B-Instruct_torch_dist"
@@ -72,10 +84,11 @@ CKPT_ARGS=(
 )
 
 ROLLOUT_ARGS=(
-   --prompt-data /root/data/dapo_openthoughts_mixed_train.jsonl
+   --prompt-data /root/math/data/train_dapo_openthoughts_mixed.jsonl
    --input-key prompt
    --label-key label
    --apply-chat-template
+   --apply-chat-template-kwargs '{"enable_thinking":false}'
    --rollout-shuffle
    --num-rollout 100
    --rollout-batch-size 4
@@ -90,21 +103,17 @@ ROLLOUT_ARGS=(
 )
 
 RM_ARGS=(
-   --custom-rm-path examples.on_policy_distillation.segmented_distillation.reward_func
-   --custom-reward-post-process-path examples.on_policy_distillation.segmented_distillation.post_process_rewards
+   --custom-rm-path examples.on_policy_distillation.on_policy_self_distillation.reward_func
+   --custom-reward-post-process-path examples.on_policy_distillation.on_policy_self_distillation.post_process_rewards
    --reward-key math_reward
 )
 
 EVAL_ARGS=(
-    --eval-interval 5
-    --eval-prompt-data aime2024 /root/data/aime2024_eval.jsonl aime2025 /root/data/aime2025_eval.jsonl amo_bench /root/data/amo_bench_eval.jsonl hmmt2025 /root/data/hmmt2025_eval.jsonl
-    --eval-max-response-len 5120
-    --eval-top-p 1.0
-    --n-samples-per-eval-prompt 1
+    --eval-interval 20
+    --eval-config examples/on_policy_distillation/eval_config.yaml
     --log-passrate
 )
 
-# 4 GPUs × 90 GB each: 2 actor GPUs (TP=1, 2-way DP) + 2 rollout GPUs
 PERF_ARGS=(
    --tensor-model-parallel-size 1
    --sequence-parallel
@@ -126,8 +135,9 @@ GRPO_ARGS=(
    --use-opd
    --opd-type opsd
    --opd-kl-coef 0.0
-   --opsd-jsd-coef 1.0
+   --opsd-loss-type jsd
    --opsd-jsd-beta 0.5
+   --opsd-jsd-coef 1.0
    --opsd-pure-mode
    --use-kl-loss
    --kl-loss-coef 0.05
@@ -152,8 +162,8 @@ WANDB_ARGS=(
 )
 
 SGLANG_ARGS=(
-   --rollout-num-gpus-per-engine 4
-   --sglang-mem-fraction-static 0.8
+   --rollout-num-gpus-per-engine 1
+   --sglang-mem-fraction-static 0.78
 )
 
 MISC_ARGS=(
@@ -163,10 +173,6 @@ MISC_ARGS=(
    --attention-softmax-in-fp32
    --attention-backend flash
    --log-probs-chunk-size 512
-)
-
-HOOK_ARGS=(
-   --custom-megatron-before-train-step-hook-path examples.on_policy_distillation.segmented_opsd_forward.register_segmented_opsd
 )
 
 
@@ -185,22 +191,17 @@ ray job submit --address="http://127.0.0.1:8265" \
      "env_vars": {
         "PYTHONPATH": "/root/Megatron-LM/",
         "CUDA_DEVICE_MAX_CONNECTIONS": "1",
-        "CUDA_VISIBLE_DEVICES": "'"${CUDA_VISIBLE_DEVICES}"'",
-
-        "SEG_STRATEGY": "fixed_length",
-        "SEG_CHUNK_SIZE": "4096",
+        "CUDA_VISIBLE_DEVICES": "4,5,6,7",
 
         "KL_WEIGHT_MODE": "inverse",
         "KL_WEIGHT_TEMP": "1.0",
-        "KL_CONFIDENCE_THRESHOLD": "",
-
-        "SEG_WEIGHT_MODE": "uniform"
+        "KL_CONFIDENCE_THRESHOLD": ""
      }
    }' \
    -- python3 train.py \
    --actor-num-nodes 1 \
-   --actor-num-gpus-per-node 4 \
-   --colocate \
+   --actor-num-gpus-per-node 2 \
+   --rollout-num-gpus 2 \
    ${MODEL_ARGS[@]} \
    ${CKPT_ARGS[@]} \
    ${ROLLOUT_ARGS[@]} \
@@ -211,8 +212,7 @@ ray job submit --address="http://127.0.0.1:8265" \
    ${EVAL_ARGS[@]} \
    ${SGLANG_ARGS[@]} \
    ${MISC_ARGS[@]} \
-   ${RM_ARGS[@]} \
-   ${HOOK_ARGS[@]}
+   ${RM_ARGS[@]}
 
 RAY_EXIT_CODE=$?
 set -e

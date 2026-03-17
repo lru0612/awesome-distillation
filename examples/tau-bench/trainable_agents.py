@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
+import httpx
 from openai_tool_adapter import create_openai_adapter
 from tau_bench.agents.base import Agent
 from tau_bench.agents.tool_calling_agent import RESPOND_ACTION_NAME, ToolCallingAgent
@@ -225,10 +226,38 @@ class TrainableAgentMixin:
             )
             # Reformulate tool call instruction for tau-bench
             text_input = self._reformulate_tool_call(text_input)
+
+            # Pre-flight context length check: avoid sending a request that will
+            # deterministically fail with a 400 (which would retry 60 times).
+            current_input_ids = state.tokenizer(text_input, add_special_tokens=False)["input_ids"]
+            max_new_tokens = sampling_params.get("max_new_tokens", 2048)
+            model_max_len = getattr(rollout_args, "rollout_max_context_len", None) or getattr(
+                state.tokenizer, "model_max_length", 40960
+            )
+            if len(current_input_ids) + max_new_tokens > model_max_len:
+                logger.warning(
+                    f"Context too long before LLM call: {len(current_input_ids)} input tokens "
+                    f"+ {max_new_tokens} max_new_tokens = {len(current_input_ids) + max_new_tokens} "
+                    f"> model_max_len {model_max_len}. Truncating."
+                )
+                res.status = Status.TRUNCATED
+                return self._build_final_result(
+                    res, total_reward, info, messages, loss_masks, prompt_token_ids, response_token_ids
+                )
+
             payload = {"text": text_input, "sampling_params": sampling_params}
 
             # Send request to sglang server
-            output = await self._call_llm(url, payload)
+            try:
+                output = await self._call_llm(url, payload)
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 400:
+                    logger.warning(f"Context length exceeded (input too long), truncating: {e}")
+                    res.status = Status.TRUNCATED
+                    return self._build_final_result(
+                        res, total_reward, info, messages, loss_masks, prompt_token_ids, response_token_ids
+                    )
+                raise
 
             # Check for abort
             if output["meta_info"]["finish_reason"]["type"] == "abort":
@@ -323,8 +352,8 @@ class TrainableAgentMixin:
                 res.status = Status.COMPLETED
                 break
 
-        # Handle truncation
-        if not env_response.done:
+        # Handle truncation (env_response is defined if loop ran at least one full iteration)
+        if res.status != Status.COMPLETED:
             res.status = Status.TRUNCATED
 
         return self._build_final_result(
@@ -398,6 +427,11 @@ class TrainableAgentMixin:
         res.tokens = prompt_token_ids + response_token_ids
         res.response = "".join([msg.get("content", "") for msg in messages if msg["role"] == "assistant"])
         res.response_length = len(loss_masks)
+
+        # Store fields needed for OPSD teacher token construction
+        res.info['initial_prompt_token_length'] = len(prompt_token_ids)
+        if len(messages) > 1 and messages[1].get('role') == 'user':
+            res.info['initial_user_message'] = messages[1]['content']
 
         logger.debug(
             f"_build_final_result: response_length={res.response_length}, "

@@ -419,6 +419,9 @@ def log_rollout_data(
                 "rollout_routed_experts",
                 "max_seq_lens",
                 "dynamic_global_batch_size",
+                # OPSD: raw token sequences — not scalar metrics
+                "teacher_tokens",
+                "teacher_prompt_lengths",
             ]:
                 continue
             # Upload per sample mean for each rollout value

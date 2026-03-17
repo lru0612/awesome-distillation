@@ -475,19 +475,50 @@ def grade_answer_mathd(given_answer: str, ground_truth: str) -> bool:
     return False
 
 
-def extract_answer(passage: str) -> str:
-    if "\\boxed" in passage:
-        return extract_boxed_answer(passage)
+def extract_answer(passage: str, mode: str = "auto") -> str | None:
+    """Extract the final answer from a model response.
+
+    Args:
+        passage: The model response string.
+        mode: Extraction mode controlling which format is tried.
+            - ``"answer"`` : Only look for ``Answer: <value>`` (DAPO / Minerva style).
+            - ``"boxed"``  : Only look for ``\\boxed{...}`` (LaTeX style).
+            - ``"auto"``   : Try ``Answer:`` first, then fall back to ``\\boxed{}``.
+              This is the legacy behaviour and can mis-fire on markdown headings
+              like ``### **Final Answer:**`` — prefer explicit modes when possible.
+
+    Returns:
+        The extracted answer string, or ``None`` if not found.
+    """
+    import re
+
+    if mode in ("answer", "auto"):
+        # "Answer: ..." on its own line (DAPO / Minerva format).
+        match = re.findall(r"(?i)Answer\s*:\s*([^\n]+)", passage)
+        if match:
+            ans = match[-1].strip().rstrip(".")
+            # Strip special tokens like <|im_end|>, <|endoftext|>, etc.
+            ans = re.sub(r"<\|[^|]*\|>", "", ans).strip().rstrip(".")
+            # Strip outer LaTeX math delimiters: $8$ → 8, $\frac{1}{2}$ → \frac{1}{2}
+            ans = re.sub(r"^\$(.+)\$$", r"\1", ans).strip()
+            if ans:
+                return ans
+
+    if mode in ("boxed", "auto"):
+        # LaTeX \boxed{} — explicit boxed format or auto fallback.
+        if "\\boxed" in passage:
+            return extract_boxed_answer(passage)
+
     return None
 
 
-def grade_answer_verl(solution_str, ground_truth):
+def grade_answer_verl(solution_str, ground_truth, mode: str = "auto"):
     if not ground_truth:
         return False
     ground_truth = str(ground_truth)
     if "\\boxed" in ground_truth:
         ground_truth = extract_answer(ground_truth)
-    given_answer = extract_answer(solution_str)
+    given_answer = extract_answer(solution_str, mode=mode)
     if given_answer is None:
         return False
     return grade_answer_mathd(given_answer, ground_truth) or grade_answer_sympy(given_answer, ground_truth)

@@ -713,6 +713,8 @@ def policy_loss_function(
         pg_loss = pg_loss * opsm_mask
 
     # Apply off-policy correction using importance sampling if enabled
+    # opsd_is_weights_flat: IS weights flattened to [total_tokens], used to re-weight OPSD JSD loss below.
+    opsd_is_weights_flat = None
     if args.get_mismatch_metrics or args.use_tis:
         # NOTE:
         # `tis_func` may apply rejection-sampling style masking (RS) and return `modified_response_masks`.
@@ -741,7 +743,26 @@ def policy_loss_function(
             tis_func = load_function(args.custom_tis_function_path)
         else:
             tis_func = vanilla_tis_function
+
         pg_loss, modified_response_masks, tis_metrics = tis_func(**tis_kwargs)
+
+        # Capture IS weights for OPSD JSD re-weighting.
+        # When use_tis is False (only get_mismatch_metrics), opsd_is_weights_flat stays None.
+        if args.use_tis and args.use_opd and getattr(args, "opd_type", None) == "opsd":
+            # Compute IS weights directly from train vs rollout log-probs.
+            # This is safe regardless of pg_loss sign (avoids inferring weights from pg_loss ratios).
+            # Boundaries: prefer MIS params (tis_lower_bound / tis_upper_bound) when set by custom
+            # config, fall back to vanilla TIS params (tis_clip_low / tis_clip).
+            # RS veto effect is separately captured via modified_response_masks → sum_of_sample_mean.
+            _w_lo = getattr(args, "tis_lower_bound", None) or getattr(args, "tis_clip_low", 0.0)
+            _w_hi = getattr(args, "tis_upper_bound", None) or getattr(args, "tis_clip", 2.0)
+            _train_lp = torch.cat(batch["log_probs"], dim=0)
+            _rollout_lp = torch.cat(batch["rollout_log_probs"], dim=0)
+            _raw_is = torch.exp(
+                torch.clamp(_train_lp - _rollout_lp, min=-20.0, max=20.0)
+            ).detach()
+            opsd_is_weights_flat = torch.clamp(_raw_is, min=_w_lo, max=_w_hi)
+            del _train_lp, _rollout_lp, _raw_is
 
         # [decouple IS and rejection] Rebuild sum_of_sample_mean with modified_response_masks for denominator correction
         # modified_response_masks will be sliced with cp in get_sum_of_sample_mean
@@ -780,9 +801,15 @@ def policy_loss_function(
     else:
         loss = pg_loss - args.entropy_coef * entropy_loss
 
-    # OPSD: add full-vocabulary JSD loss (computed by hook in forward pass)
-    if args.use_opd and args.opd_type == "opsd" and getattr(args, "opsd_jsd_coef", 0) > 0 and "opsd_jsd_values" in batch:
+    # OPSD: add JSD loss
+    # When TIS is enabled, we also re-weight the per-token JSD contributions by the IS weights
+    # so that tokens with large training-inference mismatch contribute less to the JSD gradient.
+    # RS rejection (modified_response_masks) is already baked into sum_of_sample_mean above.
+    if args.use_opd and args.opd_type == "opsd" and args.opsd_jsd_coef > 0 and "opsd_jsd_values" in batch:
         opsd_jsd = torch.cat(batch["opsd_jsd_values"], dim=0)
+        if opsd_is_weights_flat is not None:
+            # IS-weight the per-token JSD contributions (same weights used for pg_loss).
+            opsd_jsd = opsd_jsd * opsd_is_weights_flat
         opsd_jsd_loss = sum_of_sample_mean(opsd_jsd)
         loss = loss + args.opsd_jsd_coef * opsd_jsd_loss
 
@@ -851,6 +878,11 @@ def policy_loss_function(
     for key, val in batch.items():
         if key.startswith("seg_") and isinstance(val, torch.Tensor):
             reported_loss[key] = val.detach()
+
+    # Add Wiener gate weight metrics if available (wiener_kl loss type only)
+    if "opsd_wiener_weights" in batch:
+        wiener_w = torch.cat(batch["opsd_wiener_weights"], dim=0)
+        reported_loss["opsd_wiener_weight"] = sum_of_sample_mean(wiener_w).clone().detach()
 
     return loss, reported_loss
 

@@ -120,6 +120,10 @@ class EvalDatasetConfig:
 
     metadata_overrides: dict[str, Any] = field(default_factory=dict)
 
+    # Per-dataset override for apply_chat_template kwargs (e.g. {"enable_thinking": false}).
+    # When set, overrides the global --apply-chat-template-kwargs for this eval dataset only.
+    apply_chat_template_kwargs: dict[str, Any] | None = None
+
     def __post_init__(self) -> None:
         self.metadata_overrides = _ensure_metadata_overrides(self.metadata_overrides)
 
@@ -133,6 +137,8 @@ class EvalDatasetConfig:
             self.label_key,
             self.tool_key,
             self.metadata_key,
+            # Include apply_chat_template_kwargs so different prompt formats don't share a cache entry.
+            tuple(sorted(self.apply_chat_template_kwargs.items())) if self.apply_chat_template_kwargs else None,
         )
 
     def inject_metadata(self, sample_metadata: Any) -> dict[str, Any]:
