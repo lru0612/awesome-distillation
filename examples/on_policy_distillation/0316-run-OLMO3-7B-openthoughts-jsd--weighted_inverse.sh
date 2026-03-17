@@ -1,12 +1,31 @@
 #!/bin/bash
 
-# Token-KL-Weighted OPSD on OpenThoughts
+# OPSD (JSD, token-KL inverse weighted) on DAPO-Math-17k + OpenThoughts mixed dataset, with OLMo3-7B
 #
-# Same algorithm as 0301 (competition) but trains on OpenThoughts dataset.
-# Eval on AIME 2024/2025, AMO Bench, HMMT 2025.
+# Algorithm: segmented OPSD with symmetric JSD loss (opsd-jsd-beta 0.5).
+#   Token-level KL weighting: inverse (KL_WEIGHT_MODE=inverse), down-weights high-KL tokens.
+#   Segment weighting: uniform.
 #
-# Data: train uses /root/data/openthoughts_train.jsonl
-#       eval uses aime2024, aime2025, amo_bench, hmmt2025
+# Training data: DAPO-Math-17k + OpenThoughts merged into a single jsonl.
+# Eval: AIME 2024, AIME 2025, HMMT 2025, AMO Bench
+#
+# GPU: 4 × 90 GB  (2 actor GPUs + 2 rollout GPUs)
+#
+# ---------------------------------------------------------------------------
+# Data preparation (first run only):
+#
+#   # 1. Prepare DAPO-Math-17k
+#   python examples/on_policy_distillation/data_prepare/prepare_dapo.py \
+#       --mode train --num-samples 17000 \
+#       --output /root/data/dapo_train.jsonl --seed 42
+#
+#   # 2. OpenThoughts is expected at /root/data/openthoughts_train.jsonl
+#   #    (prepared separately, same format as DAPO train output above)
+#
+#   # 3. Merge both files into a single training file
+#   cat /root/data/dapo_train.jsonl /root/data/openthoughts_train.jsonl \
+#       > /root/data/dapo_openthoughts_mixed_train.jsonl
+# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # Logging: tee all output (stdout + stderr) to a timestamped log file
@@ -34,14 +53,18 @@ else
 fi
 echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
-source "/root/awesome-distillation/scripts/models/qwen3-8B.sh"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." &>/dev/null && pwd)"
+source "${REPO_ROOT}/scripts/models/olmo3-7B.sh"
 
-# Use same path for save/load: enables auto-resume when checkpoint exists.
-# On first run (no checkpoint): falls back to ref-load, trains from scratch.
-CKPT_SAVE_DIR="/root/output/Qwen3-8B_token_kl_weighted_inverse_openthoughts"
+###############################################################################
+# Training arguments
+###############################################################################
+
+CKPT_SAVE_DIR="/root/output/OLMo3-7B_opsd_dapo_openthoughts"
 CKPT_ARGS=(
-   --hf-checkpoint /root/models/Qwen3-8B
-   --ref-load "/root/models/Qwen3-8B_torch_dist"
+   --hf-checkpoint /root/models/Olmo-3-7B-Instruct
+   --ref-load "/root/models/Olmo-3-7B-Instruct_torch_dist"
    --load "${CKPT_SAVE_DIR}"
    --save "${CKPT_SAVE_DIR}"
    --save-interval 20
@@ -49,12 +72,12 @@ CKPT_ARGS=(
 )
 
 ROLLOUT_ARGS=(
-   --prompt-data /root/data/openthoughts_train.jsonl
+   --prompt-data /root/data/dapo_openthoughts_mixed_train.jsonl
    --input-key prompt
    --label-key label
    --apply-chat-template
    --rollout-shuffle
-   --num-rollout 200
+   --num-rollout 100
    --rollout-batch-size 4
    --n-samples-per-prompt 8
    --rollout-max-response-len 2048
@@ -81,6 +104,7 @@ EVAL_ARGS=(
     --log-passrate
 )
 
+# 4 GPUs × 90 GB each: 2 actor GPUs (TP=1, 2-way DP) + 2 rollout GPUs
 PERF_ARGS=(
    --tensor-model-parallel-size 1
    --sequence-parallel
@@ -123,13 +147,13 @@ OPTIMIZER_ARGS=(
 WANDB_ARGS=(
    --use-wandb
    --wandb-project slime-dev
-   --wandb-group qwen3-8B-token-kl-weighted-inverse-openthoughts
+   --wandb-group olmo3-7B-opsd-dapo-openthoughts-jsd-weighted_inverse
    --wandb-key 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
 )
 
 SGLANG_ARGS=(
-   --rollout-num-gpus-per-engine 1
-   --sglang-mem-fraction-static 0.7
+   --rollout-num-gpus-per-engine 4
+   --sglang-mem-fraction-static 0.8
 )
 
 MISC_ARGS=(
@@ -151,8 +175,8 @@ echo "Starting Ray job..."
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 unset RAY_ADDRESS
 ray stop --force || true
-export CUDA_VISIBLE_DEVICES=4,5,6,7,8,9
-ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 6 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
+export CUDA_VISIBLE_DEVICES=4,5,6,7
+ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 4 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
 
 set +e
 echo "Submitting Ray job..."
@@ -176,7 +200,7 @@ ray job submit --address="http://127.0.0.1:8265" \
    -- python3 train.py \
    --actor-num-nodes 1 \
    --actor-num-gpus-per-node 4 \
-   --rollout-num-gpus 2 \
+   --colocate \
    ${MODEL_ARGS[@]} \
    ${CKPT_ARGS[@]} \
    ${ROLLOUT_ARGS[@]} \

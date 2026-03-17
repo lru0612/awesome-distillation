@@ -19,9 +19,9 @@
 set -e
 
 
-GPU_IDS="0,1,2,3,4,5"
-SCRIPT_PATH="examples/on_policy_distillation/0302-run-qwen3-8B-token-kl-weighted_inverse-openthoughts.sh"
-POLL_INTERVAL="30"
+GPU_IDS="4,5,6,7"
+SCRIPT_PATH="examples/on_policy_distillation/start.sh"
+POLL_INTERVAL="15"
 
 # 校验脚本存在
 if [ ! -f "$SCRIPT_PATH" ]; then
@@ -35,14 +35,29 @@ if ! nvidia-smi -i "$GPU_IDS" &>/dev/null; then
     exit 1
 fi
 
-# 检查指定 GPU 上是否有用户进程
-# --query-compute-apps 返回使用 GPU 的进程，无输出表示全部空闲
+# 显存占用阈值（MiB），低于此值才视为空闲
+# 调高可容忍少量常驻显存（如 ECC/driver 占用约 100~300 MiB）
+MEM_THRESHOLD_MIB=500
+
+# 检查指定 GPU 是否空闲：逐张查询已用显存，任意一张超过阈值则视为忙碌
+# 使用 memory.used 而非 --query-compute-apps，因为 Docker 内看不到宿主机进程，
+# 但显存占用反映真实物理状态。
 is_gpu_free() {
-    local procs
-    procs=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader -i "$GPU_IDS" 2>/dev/null || echo "")
-    # 去除空行和空白
-    procs=$(echo "$procs" | tr -d ' \n')
-    [ -z "$procs" ]
+    local gpu mem_used
+    IFS=',' read -ra _gpus <<< "$GPU_IDS"
+    for gpu in "${_gpus[@]}"; do
+        mem_used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "$gpu" 2>/dev/null)
+        if [ $? -ne 0 ] || [ -z "$mem_used" ]; then
+            echo "[WARN] GPU $gpu 显存查询失败，视为忙碌"
+            return 1
+        fi
+        mem_used=$(echo "$mem_used" | tr -d ' ')
+        if [ "$mem_used" -gt "$MEM_THRESHOLD_MIB" ]; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] GPU $gpu 显存占用 ${mem_used} MiB > 阈值 ${MEM_THRESHOLD_MIB} MiB，忙碌"
+            return 1
+        fi
+    done
+    return 0
 }
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] 开始监控 GPU $GPU_IDS，轮询间隔 ${POLL_INTERVAL}s"

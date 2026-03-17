@@ -449,7 +449,7 @@ def log_rollout_data(
                         val = cp_size * sum_of_sample_mean(val) / len(loss_masks)
                     else:
                         val = torch.cat(val).clone().detach()
-                        val = val.mean() * cp_size
+                        val = val.float().mean() * cp_size
                 else:
                     val = sum(val) / len(val)
             elif isinstance(val, torch.Tensor):

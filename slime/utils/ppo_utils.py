@@ -198,6 +198,91 @@ def compute_entropy_from_logits(logits: torch.Tensor, process_group) -> torch.Te
     return _VocabParallelEntropy.apply(logits, process_group)
 
 
+class _VocabParallelJSD(torch.autograd.Function):
+    """
+    Per-token Jensen-Shannon Divergence in vocab-parallel setting.
+
+    JSD_beta(P||Q) = beta * KL(P||M) + (1-beta) * KL(Q||M)
+    where M = beta*P + (1-beta)*Q
+
+    Gradients are computed only w.r.t. student_logits (teacher is treated as detached).
+    d(JSD)/d(s_logits_k) = beta * p_k * (log(p_k/m_k) - sum_j p_j*log(p_j/m_j))
+    """
+
+    @staticmethod
+    def forward(ctx, student_logits, teacher_logits, process_group, beta):
+        # Student softmax (vocab-parallel)
+        s_max = student_logits.max(dim=-1, keepdim=True).values
+        dist.all_reduce(s_max, op=dist.ReduceOp.MAX, group=process_group)
+        s_exp = (student_logits - s_max).exp()
+        s_sum = s_exp.sum(dim=-1, keepdim=True)
+        dist.all_reduce(s_sum, group=process_group)
+        s_softmax = s_exp / s_sum
+        s_log_softmax = student_logits - s_max - s_sum.log()
+
+        # Teacher softmax (vocab-parallel)
+        t_max = teacher_logits.max(dim=-1, keepdim=True).values
+        dist.all_reduce(t_max, op=dist.ReduceOp.MAX, group=process_group)
+        t_exp = (teacher_logits - t_max).exp()
+        t_sum = t_exp.sum(dim=-1, keepdim=True)
+        dist.all_reduce(t_sum, group=process_group)
+        t_softmax = t_exp / t_sum
+        t_log_softmax = teacher_logits - t_max - t_sum.log()
+
+        # Mixture M = beta*P + (1-beta)*Q
+        mixture = beta * s_softmax + (1 - beta) * t_softmax
+        mixture_clamped = mixture.clamp(min=1e-40)
+
+        # KL(P||M) and KL(Q||M) via xlogy to safely handle p=0 (returns 0 instead of NaN)
+        kl_pm = torch.xlogy(s_softmax, s_softmax / mixture_clamped).sum(dim=-1)
+        dist.all_reduce(kl_pm, group=process_group)
+
+        kl_qm = torch.xlogy(t_softmax, t_softmax / mixture_clamped).sum(dim=-1)
+        dist.all_reduce(kl_qm, group=process_group)
+
+        jsd = beta * kl_pm + (1 - beta) * kl_qm
+
+        ctx.save_for_backward(s_softmax, mixture_clamped)
+        ctx.beta = beta
+        ctx.process_group = process_group
+        return jsd
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        s_softmax, mixture_clamped = ctx.saved_tensors
+        beta = ctx.beta
+
+        # f = log(p_i / m_i); when p_i = 0, gradient contribution is 0
+        f = torch.where(s_softmax > 0, (s_softmax / mixture_clamped).log(), torch.zeros_like(s_softmax))
+        sum_pf = torch.xlogy(s_softmax, s_softmax / mixture_clamped).sum(dim=-1, keepdim=True)
+        dist.all_reduce(sum_pf, group=ctx.process_group)
+
+        grad_s = beta * s_softmax * (f - sum_pf)
+        return grad_s * grad_output.unsqueeze(-1), None, None, None
+
+
+def compute_vocab_parallel_jsd(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    process_group: dist.ProcessGroup,
+    beta: float = 0.5,
+) -> torch.Tensor:
+    """
+    Compute per-token Jensen-Shannon Divergence between student and teacher
+    distributions in a vocab-parallel setting.
+
+    Args:
+        student_logits: [seq_len, vocab_size/tp_size] vocab-parallel student logits
+        teacher_logits: [seq_len, vocab_size/tp_size] vocab-parallel teacher logits
+        process_group: tensor parallel process group
+        beta: mixture weight (default 0.5 for symmetric JSD)
+
+    Returns:
+        jsd: [seq_len] per-token JSD values with gradients w.r.t. student_logits
+    """
+    return _VocabParallelJSD.apply(student_logits, teacher_logits, process_group, beta)
+
+
 def get_grpo_returns(
     rewards: torch.Tensor,
     kl: list[torch.Tensor],
