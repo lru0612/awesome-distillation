@@ -337,12 +337,20 @@ def _compute_opsd_jsd_in_forward(
     """
     from megatron.core.packed_seq_params import PackedSeqParams
 
+    import os
+
     from slime.utils.ppo_utils import (
+        apply_kl_confidence_weighting,
         compute_vocab_parallel_forward_kl,
         compute_vocab_parallel_jsd,
         compute_vocab_parallel_reverse_kl,
         compute_vocab_parallel_wiener_kl,
     )
+
+    _kl_weight_mode = os.environ.get("KL_WEIGHT_MODE", "").strip()
+    _kl_weight_temp = float(os.environ.get("KL_WEIGHT_TEMP", "1.0"))
+    _kl_threshold_str = os.environ.get("KL_CONFIDENCE_THRESHOLD", "").strip()
+    _kl_threshold = float(_kl_threshold_str) if _kl_threshold_str else None
 
     loss_type = getattr(args, "opsd_loss_type", "jsd")
 
@@ -489,6 +497,15 @@ def _compute_opsd_jsd_in_forward(
 
         if wiener_w_chunks:
             opsd_wiener_weights.append(torch.cat(wiener_w_chunks, dim=0))
+
+        # Apply token-level confidence weighting (entropy-based, from KL_WEIGHT_MODE env var)
+        jsd = apply_kl_confidence_weighting(
+            jsd, t_logits.float(), tp_group,
+            kl_weight_mode=_kl_weight_mode,
+            kl_weight_temp=_kl_weight_temp,
+            kl_confidence_threshold=_kl_threshold,
+        )
+
         opsd_jsd_values.append(jsd)
 
     batch["opsd_jsd_values"] = opsd_jsd_values

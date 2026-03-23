@@ -60,7 +60,7 @@ $PREPROCESS --dataset open-thoughts/OpenThoughts-114k --config metadata --split 
 
 # ---- Merge into mixed training file -----------------------------------------
 # cat /root/math/data/train_dapo.jsonl /root/math/data/train_openthoughts.jsonl \
-#     > /root/math/data/train_dapo_openthoughts_mixed.jsonl
+#     > /root/math/data/train_openthoughts.jsonl
 
 # ---- Eval datasets ----------------------------------------------------------
 $PREPROCESS --dataset math-ai/aime24             --split test  --output /root/math/data/eval_aime24.jsonl    --answer-format "$ANSWER_FORMAT"
@@ -84,7 +84,7 @@ CKPT_ARGS=(
 )
 
 ROLLOUT_ARGS=(
-   --prompt-data /root/math/data/train_dapo_openthoughts_mixed.jsonl
+   --prompt-data /root/math/data/train_openthoughts.jsonl
    --input-key prompt
    --label-key label
    --apply-chat-template
@@ -164,6 +164,7 @@ WANDB_ARGS=(
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 1
    --sglang-mem-fraction-static 0.78
+   --sglang-attention-backend triton
 )
 
 MISC_ARGS=(
@@ -180,28 +181,33 @@ echo "Starting Ray job..."
 
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 unset RAY_ADDRESS
+
+# 从 gpu_monitor 注入的环境变量读取，未设置时 fallback 到默认值
+CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-4,5,6,7}"
+NUM_GPUS=$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | wc -l)
+export CUDA_VISIBLE_DEVICES
+
 ray stop --force || true
-export CUDA_VISIBLE_DEVICES=4,5,6,7
-ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 4 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
+ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus "$NUM_GPUS" --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
 
 set +e
 echo "Submitting Ray job..."
 ray job submit --address="http://127.0.0.1:8265" \
-   --runtime-env-json='{
-     "env_vars": {
-        "PYTHONPATH": "/root/Megatron-LM/",
-        "CUDA_DEVICE_MAX_CONNECTIONS": "1",
-        "CUDA_VISIBLE_DEVICES": "4,5,6,7",
+   --runtime-env-json="{
+     \"env_vars\": {
+        \"PYTHONPATH\": \"/root/Megatron-LM/\",
+        \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
+        \"CUDA_VISIBLE_DEVICES\": \"${CUDA_VISIBLE_DEVICES}\",
 
-        "KL_WEIGHT_MODE": "uniform",
-        "KL_WEIGHT_TEMP": "1.0",
-        "KL_CONFIDENCE_THRESHOLD": ""
+        \"KL_WEIGHT_MODE\": \"uniform\",
+        \"KL_WEIGHT_TEMP\": \"1.0\",
+        \"KL_CONFIDENCE_THRESHOLD\": \"\"
      }
-   }' \
+   }" \
    -- python3 train.py \
    --actor-num-nodes 1 \
-   --actor-num-gpus-per-node 2 \
-   --rollout-num-gpus 2 \
+   --actor-num-gpus-per-node 4 \
+   --colocate \
    ${MODEL_ARGS[@]} \
    ${CKPT_ARGS[@]} \
    ${ROLLOUT_ARGS[@]} \

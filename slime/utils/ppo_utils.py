@@ -1002,6 +1002,130 @@ def compute_vocab_parallel_wiener_kl(
     return loss, w_t
 
 
+# ---------------------------------------------------------------------------
+# Token-level KL confidence weighting
+# ---------------------------------------------------------------------------
+
+def compute_teacher_token_entropy(
+    teacher_logits: torch.Tensor,
+    process_group: dist.ProcessGroup | None,
+) -> torch.Tensor:
+    """Per-token entropy of the teacher distribution (TP-aware).
+
+    Args:
+        teacher_logits: Shape [seq_len, V_local].
+        process_group: TP process group (None for single-GPU).
+
+    Returns:
+        Per-token entropy, shape [seq_len].
+    """
+    t_max = teacher_logits.max(dim=-1, keepdim=True).values
+    if process_group is not None:
+        dist.all_reduce(t_max, op=dist.ReduceOp.MAX, group=process_group)
+
+    t_shifted = teacher_logits - t_max
+    t_exp = t_shifted.exp()
+    t_sum_exp = t_exp.sum(dim=-1, keepdim=True)
+    if process_group is not None:
+        dist.all_reduce(t_sum_exp, group=process_group)
+
+    t_probs = t_exp / t_sum_exp
+    log_probs_local = t_shifted - t_sum_exp.log()
+    local_entropy = -(t_probs * log_probs_local).sum(dim=-1)
+    if process_group is not None:
+        dist.all_reduce(local_entropy, group=process_group)
+
+    return local_entropy
+
+
+def entropy_to_confidence_weights(
+    entropy: torch.Tensor,
+    mode: str = "inverse",
+    temperature: float = 1.0,
+) -> torch.Tensor:
+    """Map per-token entropy to [0, 1] confidence weights.
+
+    Low entropy → high confidence → high weight.
+
+    Modes:
+        "inverse":  w_t = 1 / (1 + tau * H_t)
+        "exp_neg":  w_t = exp(-tau * H_t)
+        "linear":   w_t = max(0, 1 - tau * H_t)
+
+    Args:
+        entropy: Per-token entropy, shape [T].
+        mode: One of "inverse", "exp_neg", "linear".
+        temperature: Sensitivity to entropy (tau).
+
+    Returns:
+        Per-token weights in [0, 1], shape [T].
+    """
+    if mode == "inverse":
+        return 1.0 / (1.0 + temperature * entropy)
+    if mode == "exp_neg":
+        return torch.exp(-temperature * entropy)
+    if mode == "linear":
+        return torch.clamp(1.0 - temperature * entropy, min=0.0)
+    raise ValueError(f"Unknown confidence weight mode: {mode!r}")
+
+
+def threshold_confidence_mask(
+    entropy: torch.Tensor,
+    threshold: float,
+) -> torch.Tensor:
+    """Binary mask that zeros out tokens above an entropy threshold.
+
+    Args:
+        entropy: Per-token entropy, shape [T].
+        threshold: Maximum tolerated entropy.
+
+    Returns:
+        Binary mask [T]: 1 where H_t <= threshold, else 0.
+    """
+    return (entropy <= threshold).float()
+
+
+def apply_kl_confidence_weighting(
+    loss_values: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    process_group: dist.ProcessGroup | None,
+    kl_weight_mode: str,
+    kl_weight_temp: float = 1.0,
+    kl_confidence_threshold: float | None = None,
+) -> torch.Tensor:
+    """Apply entropy-based confidence weighting to per-token loss values.
+
+    Reads KL_WEIGHT_MODE / KL_WEIGHT_TEMP / KL_CONFIDENCE_THRESHOLD from
+    environment variables when not supplied directly.  Called from
+    ``_compute_opsd_jsd_in_forward`` after the per-token loss is computed.
+
+    Args:
+        loss_values: Per-token loss, shape [resp_len].
+        teacher_logits: Teacher logits [resp_len, V_local] (float32).
+        process_group: TP group for all-reduce.
+        kl_weight_mode: One of "inverse" | "exp_neg" | "linear" | "" (no-op).
+        kl_weight_temp: Temperature for entropy weighting.
+        kl_confidence_threshold: Entropy threshold for masking or None.
+
+    Returns:
+        Weighted per-token loss, same shape as loss_values.
+    """
+    if not kl_weight_mode and kl_confidence_threshold is None:
+        return loss_values
+
+    entropy = compute_teacher_token_entropy(teacher_logits, process_group)
+
+    if kl_weight_mode:
+        weights = entropy_to_confidence_weights(entropy, mode=kl_weight_mode, temperature=kl_weight_temp)
+        loss_values = loss_values * weights
+
+    if kl_confidence_threshold is not None:
+        mask = threshold_confidence_mask(entropy, kl_confidence_threshold)
+        loss_values = loss_values * mask
+
+    return loss_values
+
+
 def calculate_log_probs_and_entropy(logits, tokens, tp_group, with_entropy: bool = False, chunk_size: int = -1):
     logits = logits.contiguous()
     # TODO: not sure why we need to clone the logits here.

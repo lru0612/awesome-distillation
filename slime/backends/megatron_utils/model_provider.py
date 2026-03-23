@@ -139,6 +139,8 @@ def get_model_provider_func(
                         qk_layernorm=args.qk_layernorm,
                         multi_latent_attention=args.multi_latent_attention,
                         moe_use_legacy_grouped_gemm=args.moe_use_legacy_grouped_gemm,
+                        post_self_attn_layernorm=getattr(args, "post_self_attn_layernorm", False),
+                        post_mlp_layernorm=getattr(args, "post_mlp_layernorm", False),
                     )
                 else:
                     transformer_layer_spec = get_gpt_layer_local_spec(

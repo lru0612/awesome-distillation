@@ -4,6 +4,7 @@ MODEL_ARGS=(
    --hidden-size 4096
    --ffn-hidden-size 11008
    --num-attention-heads 32
+   --num-query-groups 32
    --use-rotary-position-embeddings
    --disable-bias-linear
    --normalization "RMSNorm"
